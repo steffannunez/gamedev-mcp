@@ -1,0 +1,12 @@
+{
+  "name": "@gamedev-mcp/shared",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "unreal-engine": {
+      "command": "npx",
+      "args": ["tsx", "C:/Users/INTEL i9-11900KF/Desktop/proyectitos/Gamecosystem/gamedev-mcp/packages/unreal-mcp/src/index.ts"],
+      "env": {
+        "UNREAL_BRIDGE_URL": "http://localhost:3031"
+      }
+    },
+    "blender": {
+      "command": "npx",
+      "args": ["tsx", "C:/Users/INTEL i9-11900KF/Desktop/proyectitos/Gamecosystem/gamedev-mcp/packages/blender-mcp/src/index.ts"],
+      "env": {
+        "BLENDER_BRIDGE_URL": "http://localhost:3032"
+      }
+    }
+  }
+}

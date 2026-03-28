@@ -1,0 +1,19 @@
+{
+  "name": "gamedev-mcp",
+  "version": "1.0.0",
+  "description": "MCP servers for Unreal Engine 5 and Blender — Bfrost Studio",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev:unreal": "tsx packages/unreal-mcp/src/index.ts",
+    "dev:blender": "tsx packages/blender-mcp/src/index.ts",
+    "inspect:unreal": "npx @modelcontextprotocol/inspector tsx packages/unreal-mcp/src/index.ts",
+    "inspect:blender": "npx @modelcontextprotocol/inspector tsx packages/blender-mcp/src/index.ts"
+  },
+  "author": "Bfrost Studio",
+  "license": "MIT"
+}
