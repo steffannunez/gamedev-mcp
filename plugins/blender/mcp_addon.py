@@ -420,6 +420,43 @@ def set_bone_transform(armature_name, bone_name, frame, location=None, rotation=
     return {"bone": bone_name, "frame": frame}
 
 
+def extract_textures(output_dir, object_name=None):
+    """Extract all texture images from materials to disk."""
+    os.makedirs(output_dir, exist_ok=True)
+    exported = []
+
+    # Gather materials to check
+    if object_name:
+        obj = bpy.data.objects.get(object_name)
+        if not obj or not hasattr(obj.data, "materials"):
+            return {"error": f"Object not found or has no materials: {object_name}"}
+        materials = [m for m in obj.data.materials if m]
+    else:
+        materials = [m for m in bpy.data.materials if m]
+
+    for mat in materials:
+        if not mat.use_nodes:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image:
+                img = node.image
+                file_name = f"T_{mat.name}_{img.name}.png"
+                file_path = os.path.join(output_dir, file_name)
+                # Save image to disk
+                img.save_render(filepath=file_path)
+                exported.append({"material": mat.name, "image": img.name, "path": file_path, "size": [img.size[0], img.size[1]]})
+
+    # Also check for packed images not in nodes
+    for img in bpy.data.images:
+        if img.type == "IMAGE" and img.has_data and not any(e["image"] == img.name for e in exported):
+            file_name = f"T_{img.name}.png"
+            file_path = os.path.join(output_dir, file_name)
+            img.save_render(filepath=file_path)
+            exported.append({"material": "standalone", "image": img.name, "path": file_path, "size": [img.size[0], img.size[1]]})
+
+    return {"textures_exported": len(exported), "files": exported}
+
+
 # ── Handler Dispatch Table ──────────────────────────────
 
 HANDLERS = {
@@ -444,6 +481,7 @@ HANDLERS = {
     "rig_character": rig_character,
     "add_animation": add_animation,
     "set_bone_transform": set_bone_transform,
+    "extract_textures": extract_textures,
 }
 
 

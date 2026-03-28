@@ -130,7 +130,7 @@ def query_actors(class_filter=None, tag=None, name_pattern=None):
 
 # ── Asset Commands ──────────────────────────────────────
 
-def import_asset(file_path, destination, asset_name=None):
+def import_asset(file_path, destination, asset_name=None, skeleton_path=None):
     if not os.path.exists(file_path):
         return {"error": f"File not found: {file_path}"}
 
@@ -144,12 +144,33 @@ def import_asset(file_path, destination, asset_name=None):
     if asset_name:
         task.set_editor_property("destination_name", asset_name)
 
+    # For FBX files, configure import options
+    if file_path.lower().endswith(".fbx"):
+        factory = unreal.FbxFactory()
+        task.set_editor_property("factory", factory)
+        options = unreal.FbxImportUI()
+        options.set_editor_property("automated_import_should_detect_type", True)
+
+        if skeleton_path:
+            skeleton = unreal.EditorAssetLibrary.load_asset(skeleton_path)
+            if skeleton:
+                options.set_editor_property("skeleton", skeleton)
+                options.set_editor_property("mesh_type_to_import", unreal.FBXImportType.FBXIT_ANIMATION)
+                options.set_editor_property("import_mesh", False)
+                options.set_editor_property("import_animations", True)
+                options.set_editor_property("import_as_skeletal", True)
+
+        task.set_editor_property("options", options)
+
     # Try standard import
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
 
     # Check result
     imported = task.get_editor_property("imported_object_paths")
-    result_objs = task.get_editor_property("result")
+    try:
+        result_objs = task.get_editor_property("result")
+    except Exception:
+        result_objs = None
 
     if imported and len(imported) > 0:
         return {
