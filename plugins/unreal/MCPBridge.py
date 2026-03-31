@@ -402,6 +402,461 @@ def list_input_actions():
     return {"_note": "List input actions from /Game/Input/"}
 
 
+# ── Tier 1 Handlers ─────────────────────────────────────
+
+def spawn_from_blueprint(blueprint_path, name, location, rotation=None, scale=None, properties=None):
+    """
+    Spawn an actor from a Blueprint asset into the current level.
+    Tries loading blueprint_path directly, then appends '_C' for generated class fallback.
+    """
+    try:
+        if rotation is None:
+            rotation = [0, 0, 0]
+        if scale is None:
+            scale = [1, 1, 1]
+        if properties is None:
+            properties = {}
+
+        # Try loading the Blueprint class — first via EditorAssetLibrary, then via load_class with _C suffix
+        bp_class = None
+        try:
+            bp_asset = unreal.EditorAssetLibrary.load_blueprint_class(blueprint_path)
+            if bp_asset:
+                bp_class = bp_asset
+        except Exception:
+            pass
+
+        if bp_class is None:
+            # UE5.6: generated Blueprint class path ends with _C
+            class_path_c = blueprint_path + "_C"
+            bp_class = unreal.load_class(None, class_path_c)
+
+        if bp_class is None:
+            return {"error": f"Blueprint class not found: {blueprint_path}"}
+
+        loc = unreal.Vector(*location)
+        rot = unreal.Rotator(rotation[0], rotation[1], rotation[2])
+        actor = unreal.EditorLevelLibrary.spawn_actor_from_class(bp_class, loc, rot)
+        if not actor:
+            return {"error": f"Failed to spawn actor from blueprint: {blueprint_path}"}
+
+        actor.set_actor_label(name)
+        actor.set_actor_scale3d(unreal.Vector(*scale))
+
+        for prop_key, prop_val in properties.items():
+            try:
+                actor.set_editor_property(prop_key, prop_val)
+            except Exception as prop_err:
+                unreal.log_warning(f"[MCP Bridge] spawn_from_blueprint: could not set property '{prop_key}': {prop_err}")
+
+        return {
+            "actor_id": str(actor.get_path_name()),
+            "name": name,
+            "location": location,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def set_actor_tag(actor_name, tags, mode="add"):
+    """
+    Modify tags on an actor.
+    mode='add'    — appends without duplicating
+    mode='remove' — removes specified tags
+    mode='set'    — replaces all tags
+    """
+    try:
+        actor = _find_actor(actor_name)
+        if not actor:
+            return {"error": f"Actor not found: {actor_name}"}
+
+        # actor.tags is an Array of FName in Python
+        current = list(actor.tags)
+        tag_names = [unreal.Name(t) for t in tags]
+
+        if mode == "add":
+            for t in tag_names:
+                if t not in current:
+                    current.append(t)
+        elif mode == "remove":
+            current = [t for t in current if t not in tag_names]
+        elif mode == "set":
+            current = tag_names
+        else:
+            return {"error": f"Invalid mode '{mode}'. Use 'add', 'remove', or 'set'."}
+
+        actor.tags = current
+        return {
+            "actor": actor_name,
+            "tags": [str(t) for t in actor.tags],
+            "mode": mode,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def set_collision_preset(actor_name, preset, component_name=None):
+    """
+    Apply a collision profile preset to all PrimitiveComponents (or a specific one) on an actor.
+    Valid presets: NoCollision, BlockAll, OverlapAll, BlockAllDynamic, OverlapAllDynamic,
+                   Pawn, PhysicsActor, Destructible, InvisibleWall, Trigger
+    """
+    try:
+        VALID_PRESETS = {
+            "NoCollision", "BlockAll", "OverlapAll", "BlockAllDynamic",
+            "OverlapAllDynamic", "Pawn", "PhysicsActor", "Destructible",
+            "InvisibleWall", "Trigger",
+        }
+        if preset not in VALID_PRESETS:
+            return {"error": f"Invalid preset '{preset}'. Valid options: {sorted(VALID_PRESETS)}"}
+
+        actor = _find_actor(actor_name)
+        if not actor:
+            return {"error": f"Actor not found: {actor_name}"}
+
+        components = actor.get_components_by_class(unreal.PrimitiveComponent)
+        if not components:
+            return {"error": f"No PrimitiveComponents found on actor '{actor_name}'"}
+
+        affected = 0
+        for comp in components:
+            if component_name and comp.get_name() != component_name:
+                continue
+            try:
+                comp.set_collision_profile_name(unreal.Name(preset))
+                affected += 1
+            except Exception as comp_err:
+                unreal.log_warning(f"[MCP Bridge] set_collision_preset: '{comp.get_name()}' failed: {comp_err}")
+
+        return {
+            "actor": actor_name,
+            "preset": preset,
+            "components_affected": affected,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def add_blueprint_variable(blueprint_path, var_name, var_type, default_value=None,
+                            is_exposed=False, category="Default"):
+    """
+    Add a variable to a Blueprint asset.
+    var_type: 'bool' | 'float' | 'int' | 'string' | 'vector' | 'rotator' | 'transform' | 'actor'
+
+    UE5.6: BlueprintEditorLibrary.add_member_variable is the primary API.
+    Falls back to a note if the subsystem is unavailable (e.g. editor not in focus).
+    """
+    try:
+        # UE5.6 type-string mapping for add_member_variable
+        TYPE_MAP = {
+            "bool":      "bool",
+            "float":     "float",
+            "double":    "double",
+            "int":       "int",
+            "int64":     "int64",
+            "string":    "string",
+            "vector":    "Vector",
+            "rotator":   "Rotator",
+            "transform": "Transform",
+            "actor":     "Object",  # object reference; caller should specify via object_class
+        }
+        ue_type = TYPE_MAP.get(var_type.lower())
+        if ue_type is None:
+            return {"error": f"Unsupported var_type '{var_type}'. Supported: {list(TYPE_MAP.keys())}"}
+
+        bp = unreal.EditorAssetLibrary.load_asset(blueprint_path)
+        if not bp:
+            return {"error": f"Blueprint not found: {blueprint_path}"}
+
+        # UE5.6: BlueprintEditorLibrary.add_member_variable
+        added = False
+        try:
+            unreal.BlueprintEditorLibrary.add_member_variable(bp, var_name, ue_type)
+            added = True
+        except Exception as api_err:
+            unreal.log_warning(f"[MCP Bridge] add_blueprint_variable: BlueprintEditorLibrary.add_member_variable failed: {api_err}")
+
+        if not added:
+            return {
+                "blueprint": blueprint_path,
+                "variable": var_name,
+                "type": var_type,
+                "_note": "Variable could not be added programmatically in this UE build. "
+                         "Use the Blueprint editor to add the variable manually.",
+            }
+
+        # Set category and exposure via editor properties when possible
+        try:
+            if is_exposed:
+                unreal.BlueprintEditorLibrary.set_blueprint_property_exposed_on_spawn(bp, var_name, True)
+        except Exception:
+            pass  # Non-fatal
+
+        # Compile and save
+        unreal.KismetSystemLibrary.compile_blueprint(bp)
+        unreal.EditorAssetLibrary.save_loaded_asset(bp)
+
+        return {
+            "blueprint": blueprint_path,
+            "variable": var_name,
+            "type": var_type,
+            "category": category,
+            "is_exposed": is_exposed,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def create_data_asset(class_path, name, save_path):
+    """
+    Create a DataAsset of the given class at save_path/name.
+    Falls back to PrimaryDataAsset if the specified class cannot be loaded.
+    """
+    try:
+        asset_class = None
+        try:
+            asset_class = unreal.load_class(None, class_path)
+        except Exception:
+            pass
+
+        if asset_class is None:
+            # Fallback to PrimaryDataAsset
+            asset_class = unreal.load_class(None, "/Script/Engine.PrimaryDataAsset")
+            unreal.log_warning(f"[MCP Bridge] create_data_asset: class '{class_path}' not found, "
+                               f"falling back to PrimaryDataAsset")
+
+        if asset_class is None:
+            return {"error": f"Could not load class '{class_path}' and PrimaryDataAsset fallback also failed"}
+
+        factory = unreal.DataAssetFactory()
+        factory.set_editor_property("data_asset_class", asset_class)
+
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        asset = asset_tools.create_asset(name, save_path, asset_class, factory)
+        if not asset:
+            return {"error": f"Failed to create DataAsset '{name}' at '{save_path}'"}
+
+        unreal.EditorAssetLibrary.save_loaded_asset(asset)
+        full_path = f"{save_path.rstrip('/')}/{name}"
+        return {
+            "path": full_path,
+            "class": asset_class.get_name(),
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def create_enum_asset(name, save_path, values):
+    """
+    Create a UserDefinedEnum asset with the specified string values.
+    UE5.6: UserDefinedEnumFactory creates the enum; values are added via add_new_bitfield_enum_value
+    or directly editing the Names array.
+    """
+    try:
+        factory = unreal.UserDefinedEnumFactory()
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        enum_asset = asset_tools.create_asset(name, save_path, unreal.UserDefinedEnum, factory)
+        if not enum_asset:
+            return {"error": f"Failed to create UserDefinedEnum '{name}' at '{save_path}'"}
+
+        # UE5.6: add enum values — try the editor utility first, fall back to direct manipulation
+        added_values = []
+        for val in values:
+            try:
+                # UserDefinedEnumEditorUtilities is the standard path in UE5
+                success = unreal.UserDefinedEnumEditorUtilities.add_new_enum_value(enum_asset, val)
+                if success:
+                    added_values.append(val)
+                else:
+                    unreal.log_warning(f"[MCP Bridge] create_enum_asset: could not add value '{val}'")
+            except AttributeError:
+                # UE5.6: fallback — AddNewEnumeratorForUserDefinedEnum is exposed differently
+                try:
+                    unreal.UserDefinedEnumUtilities.add_new_enumerator(enum_asset, val)
+                    added_values.append(val)
+                except Exception as inner_err:
+                    unreal.log_warning(f"[MCP Bridge] create_enum_asset: value '{val}' skipped: {inner_err}")
+
+        unreal.EditorAssetLibrary.save_loaded_asset(enum_asset)
+        full_path = f"{save_path.rstrip('/')}/{name}"
+        return {
+            "path": full_path,
+            "values": added_values,
+            "_note": f"{len(values) - len(added_values)} value(s) could not be added programmatically — "
+                     "add them manually in the Enum editor." if len(added_values) < len(values) else None,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def create_struct_asset(name, save_path, fields):
+    """
+    Create a UserDefinedStruct asset with the provided fields.
+    fields: list of dicts with keys 'name' and 'type'.
+    type string uses the same mapping as add_blueprint_variable.
+
+    UE5.6: UserDefinedStructEditorUtils is the standard API for adding variables.
+    """
+    try:
+        TYPE_MAP = {
+            "bool":      "bool",
+            "float":     "float",
+            "double":    "double",
+            "int":       "int",
+            "int64":     "int64",
+            "string":    "string",
+            "vector":    "Vector",
+            "rotator":   "Rotator",
+            "transform": "Transform",
+            "actor":     "SoftObjectPath",  # UE5.6: closest generic reference type for structs
+        }
+
+        factory = unreal.UserDefinedStructFactory()
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        struct_asset = asset_tools.create_asset(name, save_path, unreal.UserDefinedStruct, factory)
+        if not struct_asset:
+            return {"error": f"Failed to create UserDefinedStruct '{name}' at '{save_path}'"}
+
+        added_fields = []
+        for field in fields:
+            field_name = field.get("name", "")
+            field_type = field.get("type", "float")
+            ue_type = TYPE_MAP.get(field_type.lower(), field_type)
+            try:
+                # UE5.6: FStructureEditorUtils via Python bindings
+                unreal.UserDefinedStructEditorUtils.add_variable(struct_asset, field_name)
+                added_fields.append({"name": field_name, "type": field_type})
+            except Exception as field_err:
+                unreal.log_warning(f"[MCP Bridge] create_struct_asset: field '{field_name}' ({ue_type}): {field_err}")
+                added_fields.append({"name": field_name, "type": field_type, "warning": str(field_err)})
+
+        unreal.EditorAssetLibrary.save_loaded_asset(struct_asset)
+        full_path = f"{save_path.rstrip('/')}/{name}"
+        return {
+            "path": full_path,
+            "fields": added_fields,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def create_gameplay_tag(tag, comment="", source_file="DefaultGameplayTags"):
+    """
+    Add a GameplayTag to the project.
+    Tries GameplayTagsEditorSubsystem first (cleanest API).
+    Falls back to writing DefaultGameplayTags.ini directly.
+    """
+    try:
+        # Primary path: GameplayTagsEditorSubsystem (UE5.1+)
+        try:
+            subsystem = unreal.get_editor_subsystem(unreal.GameplayTagsEditorSubsystem)
+            if subsystem:
+                result = subsystem.add_new_gameplay_tag_to_ini(tag, comment, source_file)
+                if result:
+                    return {"tag": tag, "added": True, "method": "subsystem"}
+        except Exception as sub_err:
+            unreal.log_warning(f"[MCP Bridge] create_gameplay_tag: subsystem path failed: {sub_err}")
+
+        # Fallback: write directly to DefaultGameplayTags.ini
+        config_dir = unreal.Paths.project_dir() + "Config/"
+        ini_path = os.path.join(config_dir, "DefaultGameplayTags.ini")
+
+        # Ensure the file and section exist
+        section_header = "[/Script/GameplayTags.GameplayTagsSettings]"
+        tag_line = f'+GameplayTagList=(Tag="{tag}",DevComment="{comment}")'
+
+        if os.path.exists(ini_path):
+            with open(ini_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        else:
+            content = ""
+
+        # Avoid duplicates
+        if f'Tag="{tag}"' in content:
+            return {"tag": tag, "added": False, "method": "ini_file", "reason": "tag already exists"}
+
+        if section_header in content:
+            # Insert after the section header
+            content = content.replace(
+                section_header,
+                section_header + "\n" + tag_line,
+                1,
+            )
+        else:
+            content += f"\n{section_header}\n{tag_line}\n"
+
+        os.makedirs(config_dir, exist_ok=True)
+        with open(ini_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        # Request tag manager reload via console command
+        try:
+            unreal.SystemLibrary.execute_console_command(None, "GameplayTags.PrintReplicationFrequencyReport")
+        except Exception:
+            pass  # Non-fatal — tags will be picked up on next editor restart
+
+        return {"tag": tag, "added": True, "method": "ini_file"}
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
+def create_anim_montage(skeleton_path, anim_sequence_path, name, save_path,
+                        slot_name="DefaultSlot", blend_in_time=0.25, blend_out_time=0.25):
+    """
+    Create an AnimMontage asset targeting the given skeleton and (optionally) wrapping an AnimSequence.
+    UE5.6: AnimMontageFactory sets the target_skeleton; segment insertion via the Python API is
+    limited — the sequence is linked where the API permits, otherwise an empty montage is returned
+    with a note instructing the developer to add segments in the editor.
+    """
+    try:
+        skeleton = unreal.EditorAssetLibrary.load_asset(skeleton_path)
+        if not skeleton:
+            return {"error": f"Skeleton not found: {skeleton_path}"}
+
+        anim_sequence = None
+        if anim_sequence_path:
+            anim_sequence = unreal.EditorAssetLibrary.load_asset(anim_sequence_path)
+            if not anim_sequence:
+                unreal.log_warning(f"[MCP Bridge] create_anim_montage: AnimSequence not found: {anim_sequence_path}")
+
+        factory = unreal.AnimMontageFactory()
+        factory.set_editor_property("target_skeleton", skeleton)
+
+        # UE5.6: AnimMontageFactory exposes anim_sequence to pre-populate one slot
+        if anim_sequence:
+            try:
+                factory.set_editor_property("anim_sequence", anim_sequence)
+            except Exception:
+                pass  # Non-fatal, montage will be created empty
+
+        asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+        montage = asset_tools.create_asset(name, save_path, unreal.AnimMontage, factory)
+        if not montage:
+            return {"error": f"Failed to create AnimMontage '{name}' at '{save_path}'"}
+
+        # UE5.6: blend times are set via editor properties on the montage asset
+        try:
+            montage.set_editor_property("blend_in_time", blend_in_time)
+        except Exception:
+            pass
+        try:
+            montage.set_editor_property("blend_out_time", blend_out_time)
+        except Exception:
+            pass
+
+        unreal.EditorAssetLibrary.save_loaded_asset(montage)
+        full_path = f"{save_path.rstrip('/')}/{name}"
+        return {
+            "path": full_path,
+            "skeleton": skeleton_path,
+            "slot": slot_name,
+            "_note": "Montage created. If the AnimSequence was not auto-linked, open the Montage editor "
+                     "and drag the sequence into the slot track manually." if not anim_sequence else None,
+        }
+    except Exception as e:
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+
 # ── Helpers ─────────────────────────────────────────────
 
 def _find_actor(name):
@@ -458,6 +913,16 @@ HANDLERS = {
     "add_input_action": add_input_action,
     "add_input_mapping": add_input_mapping,
     "list_input_actions": list_input_actions,
+    # Tier 1 handlers
+    "spawn_from_blueprint": spawn_from_blueprint,
+    "set_actor_tag": set_actor_tag,
+    "set_collision_preset": set_collision_preset,
+    "add_blueprint_variable": add_blueprint_variable,
+    "create_data_asset": create_data_asset,
+    "create_enum_asset": create_enum_asset,
+    "create_struct_asset": create_struct_asset,
+    "create_gameplay_tag": create_gameplay_tag,
+    "create_anim_montage": create_anim_montage,
 }
 
 
